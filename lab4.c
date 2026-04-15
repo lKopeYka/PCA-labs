@@ -1,181 +1,230 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <conio.h>
-#include <dos.h>
+#include <dos.h>     
+#include <stdio.h>    
+#include <conio.h>    
 
-#define TIMER_REG_AMOUNT 3
-#define TIME_REG_AMOUNT 6
+volatile unsigned long msCounter = 0; 
+volatile int alarmFlag = 0;           
+void interrupt far(*oldInt70h)(void);  
 
-typedef unsigned char byte;
+const char* DAYS[] = { "", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
 
-enum time_registers {
-  sec = 0x00,
-  sec_timer = 0x01,
-  min = 0x02,
-  min_timer = 0x03,
-  hour = 0x04,
-  hour_timer = 0x05,
-  day = 0x07,
-  month = 0x08,
-  year = 0x09,
-};
+void interrupt far NewInt70Handler(void);  
+int BCDToInteger(unsigned char bcd);       
+unsigned char IntToBCD(int value);         
+void WaitClockIsFree();                   
+void GetTime();                            
+void SetTime();                            
+void CustomDelay();                        
+void SetAlarm();                           
 
-enum state_registers {
-  A = 0x0A,
-  B = 0x0B,
-  C = 0x0C,
-  D = 0x0D,
-};
 
-unsigned time[TIME_REG_AMOUNT];
-const byte time_regs[TIME_REG_AMOUNT] = {sec, min, hour, day, month, year};
-const byte timer_regs[TIMER_REG_AMOUNT] = {sec_timer, min_timer, hour_timer};
-
-volatile int alarm_flag = 0;
-
-unsigned bcd_to_dec(unsigned bcd) { return (bcd / 16 * 10) + (bcd % 16); }
-unsigned dec_to_bcd(unsigned dec) { return (dec / 10 * 16) + (dec % 10); }
-
-void wait_UIP() {
-  do {
-    outp(0x70, A);
-  } while (inp(0x71) & 0x80);
+// Чтение значения из CMOS-памяти
+// reg - номер регистра CMOS 
+// @return значение из указанного регистра
+unsigned char ReadCMOS(unsigned char reg) {
+    outp(0x70, reg);     
+    return inp(0x71);     
 }
 
-void print_time(void) {
-  int i;
-
-  for (i = 0; i < TIME_REG_AMOUNT; ++i) {
-    wait_UIP();
-
-    outp(0x70, time_regs[i]);
-    time[i] = bcd_to_dec(inp(0x71));
-  }
-
-  printf("%02u:%02u:%02u %02u.%02u.20%02u\n",
-    time[2], time[1], time[0], time[3], time[4], time[5]);
+/**
+ * Запись значения в CMOS-память
+ * @param reg - номер регистра CMOS
+ * @param value - записываемое значение
+ */
+void WriteCMOS(unsigned char reg, unsigned char value) {
+    outp(0x70, reg);      // Выбор регистра
+    outp(0x71, value);    // Запись данных
 }
 
-void set_time(void) {
-  int i;
-  byte reg;
+/**
+ * Обработчик прерывания RTC
+ * Вызывается при каждом прерывании от часов реального времени
+ */
+void interrupt far NewInt70Handler(void) {
+    unsigned char statusC;
+    outp(0x70, 0x0C);                // Выбираем регистр состояния C
+    statusC = inp(0x71);             // Читаем его (это сбрасывает флаги прерываний)
 
-  puts("Enter time (hh:mm:ss):");
-  scanf("%u:%u:%u", &time[2], &time[1], &time[0]);
+    // Проверяем биты в регистре состояния C
+    if (statusC & 0x40) msCounter++; // Бит 6 (0x40) - периодическое прерывание (каждую миллисекунду)
+    if (statusC & 0x20) alarmFlag = 1; // Бит 5 (0x20) - прерывание от будильника
 
-  puts("Enter date (dd.mm.yy):");
-  scanf("%u.%u.%u", &time[3], &time[4], &time[5]);
-
-  for (i = 0; i < TIME_REG_AMOUNT; ++i)
-    time[i] = dec_to_bcd(time[i]);
-
-  disable();
-
-  wait_UIP();
-
-  // читаем регистр B
-  outp(0x70, B);
-  reg = inp(0x71);
-
-  // запрещаем обновление
-  outp(0x70, B);
-  outp(0x71, reg | 0x80);
-
-  // запись времени
-  for (i = 0; i < TIME_REG_AMOUNT; i++) {
-    outp(0x70, time_regs[i]);
-    outp(0x71, time[i]);
-  }
-
-  // включаем обновление обратно
-  outp(0x70, B);
-  outp(0x71, reg & 0x7F);
-
-  enable();
+    // Отправляем EOI (End Of Interrupt) контроллерам прерываний
+    outp(0xA0, 0x20);  // Для второго контроллера (IRQ8-15)
+    outp(0x20, 0x20);  // Для первого контроллера (IRQ0-7)
 }
 
-void interrupt(*old_interrupt)(void);
+void main() {
+    char c = 0;
+    clrscr();  
 
-void interrupt new_interrupt(void) {
-  outp(0x70, C);
-  if (inp(0x71) & 0x20) {
-    alarm_flag = 1; // только флаг!
-  }
+    printf("RTC Lab Work Control (Date & Time Edition)\n");
+    printf("1 - Show Date & Time\n2 - Set Date & Time\n3 - Delay (ms)\n4 - Set Alarm\nESC - Exit\n");
 
-  outp(0x20, 0x20);
-  outp(0xA0, 0x20);
+    while (c != 27) {
+        if (kbhit()) {           
+            c = getch();        
+            switch (c) {
+            case '1': GetTime(); break;      
+            case '2': SetTime(); break;     
+            case '3': CustomDelay(); break;  
+            case '4': SetAlarm(); break;    
+            }
+        }
+    }
+}
+   
+
+/**
+ * Ожидание, пока часы не освободятся для доступа
+ * Бит 7 регистра 0x0A показывает, идет ли обновление времени
+ */
+void WaitClockIsFree() {
+    while (ReadCMOS(0x0A) & 0x80);  // Ждем, пока бит UIP (Update In Progress) не станет 0
 }
 
-void set_alarm(void) {
-  int i;
+/**
+ * Получение и вывод текущей даты и времени из CMOS
+ */
+void GetTime() {
+    unsigned char s, m, h, dayW, dayM, mon, year;
+    WaitClockIsFree();  // Ждем, пока часы не освободятся для чтения
 
-  puts("Enter alarm time (hh:mm:ss):");
-  scanf("%u:%u:%u", &time[2], &time[1], &time[0]);
+    // Чтение всех необходимых регистров CMOS
+    s = ReadCMOS(0x00);      // Секунды
+    m = ReadCMOS(0x02);      // Минуты
+    h = ReadCMOS(0x04);      // Часы
+    dayW = ReadCMOS(0x06);   // День недели (1-7)
+    dayM = ReadCMOS(0x07);   // Число месяца (1-31)
+    mon = ReadCMOS(0x08);    // Месяц (1-12)
+    year = ReadCMOS(0x09);   // Год (0-99)
 
-  for (i = 0; i < TIMER_REG_AMOUNT; ++i)
-    time[i] = dec_to_bcd(time[i]);
-
-  disable();
-
-  old_interrupt = getvect(0x70);
-  setvect(0x70, new_interrupt);
-
-  // разрешаем IRQ8
-  outp(0xA1, inp(0xA1) & 0xFE);
-
-  wait_UIP();
-
-  for (i = 0; i < TIMER_REG_AMOUNT; i++) {
-    outp(0x70, timer_regs[i]);
-    outp(0x71, time[i]);
-  }
-
-  // включаем будильник
-  outp(0x70, B);
-  outp(0x71, inp(0x71) | 0x20);
-
-  enable();
-
-  puts("Alarm set");
+    // Вывод даты и времени с преобразованием BCD в десятичные числа
+    printf("\nDate: %02d.%02d.20%02d (%s)",
+        BCDToInteger(dayM), BCDToInteger(mon), BCDToInteger(year),
+        (dayW > 0 && dayW < 8) ? DAYS[dayW] : "Unknown");
+    printf("\nTime: %02d:%02d:%02d\n", BCDToInteger(h), BCDToInteger(m), BCDToInteger(s));
 }
 
-void set_delay(void) {
-  byte reg;
+/**
+ * Установка даты и времени в CMOS
+ * Пользователь вводит значения, которые затем записываются в регистры
+ */
+void SetTime() {
+    int h, m, s, dayW, dayM, mon, yr;
+    unsigned char regB;
 
-  disable();
+    printf("\nEnter Time (h m s): ");
+    scanf("%d %d %d", &h, &m, &s);
+    printf("Enter Date (day month year_2_digits): ");
+    scanf("%d %d %d", &dayM, &mon, &yr);
+    printf("Enter Day of Week (1-Sun, 2-Mon, ..., 7-Sat): ");
+    scanf("%d", &dayW);
 
-  wait_UIP();
+    WaitClockIsFree();                    // Ждем освобождения часов
+    regB = ReadCMOS(0x0B);                // Читаем регистр управления B
+    WriteCMOS(0x0B, regB | 0x80);         // Устанавливаем бит SET (бит 7) - останавливаем обновление времени
 
-  outp(0x70, A);
-  reg = inp(0x71);
+    // Записываем новые значения в BCD формате
+    WriteCMOS(0x00, IntToBCD(s));    // Секунды
+    WriteCMOS(0x02, IntToBCD(m));    // Минуты
+    WriteCMOS(0x04, IntToBCD(h));    // Часы
+    WriteCMOS(0x06, IntToBCD(dayW)); // День недели
+    WriteCMOS(0x07, IntToBCD(dayM)); // Число
+    WriteCMOS(0x08, IntToBCD(mon));  // Месяц
+    WriteCMOS(0x09, IntToBCD(yr));   // Год
 
-  outp(0x70, A);
-  outp(0x71, (reg & 0xF0) | 0x06); // 1024 Гц
-
-  enable();
-
-  puts("Delay frequency set to 1024 Hz");
+    WriteCMOS(0x0B, regB & 0x7F);    // Снимаем бит SET - возобновляем обновление времени
+    printf("Date and Time updated.\n");
 }
 
-int main(void) {
-  while (1) {
-    if (alarm_flag) {
-      puts("ALARM!");
-      alarm_flag = 0;
+/**
+ * Функция задержки в миллисекундах с использованием RTC
+ * Настраивает периодические прерывания от часов
+ */
+void CustomDelay() {
+    unsigned long delayMs;
+    unsigned char oldB, oldMask, oldA;
+
+    printf("\nEnter delay in ms: ");
+    scanf("%lu", &delayMs);
+
+    disable();                                      // Запрещаем прерывания
+    oldInt70h = getvect(0x70);                      // Сохраняем старый обработчик IRQ8 (прерывание 0x70)
+    setvect(0x70, NewInt70Handler);                 // Устанавливаем свой обработчик
+
+    oldA = ReadCMOS(0x0A);                          // Сохраняем регистр A
+    WriteCMOS(0x0A, (oldA & 0xF0) | 0x06);          // Настраиваем частоту прерываний (0x06 = 1024 Гц)
+
+    oldMask = inp(0xA1);                            // Сохраняем маску прерываний
+    outp(0xA1, oldMask & 0xFE);                     // Разрешаем IRQ8 (бит 0 маски)
+
+    oldB = ReadCMOS(0x0B);                          // Сохраняем регистр B
+    WriteCMOS(0x0B, oldB | 0x40);                   // Включаем периодические прерывания (бит 6)
+
+    msCounter = 0;                                  // Обнуляем счетчик
+    enable();                                       // Разрешаем прерывания
+
+    printf("Waiting...");
+    while (msCounter < delayMs);                    // Ждем, пока не наберется нужное количество миллисекунд
+    printf("\n[Done] %lu ms passed!\n", delayMs);
+
+    disable();                                      // Запрещаем прерывания
+    WriteCMOS(0x0B, oldB);                          // Восстанавливаем регистр B
+    WriteCMOS(0x0A, oldA);                          // Восстанавливаем регистр A
+    outp(0xA1, oldMask);                            // Восстанавливаем маску прерываний
+    setvect(0x70, oldInt70h);                       // Восстанавливаем старый обработчик
+    enable();                                       // Разрешаем прерывания
+}
+
+/**
+ * Установка будильника
+ * При достижении заданного времени срабатывает прерывание
+ */
+void SetAlarm() {
+    int h, m, s;
+    unsigned char oldB, oldMask;
+
+    printf("\nEnter Alarm Time (h m s): ");
+    scanf("%d %d %d", &h, &m, &s);
+
+    disable();                                      // Запрещаем прерывания
+    oldInt70h = getvect(0x70);                      // Сохраняем старый обработчик
+    setvect(0x70, NewInt70Handler);                 // Устанавливаем свой обработчик
+    oldMask = inp(0xA1);                            // Сохраняем маску
+    outp(0xA1, oldMask & 0xFE);                     // Разрешаем IRQ8
+
+    // Записываем время будильника в регистры CMOS
+    WriteCMOS(0x05, IntToBCD(h));    // Часы будильника
+    WriteCMOS(0x03, IntToBCD(m));    // Минуты будильника
+    WriteCMOS(0x01, IntToBCD(s));    // Секунды будильника
+
+    oldB = ReadCMOS(0x0B);                          // Сохраняем регистр B
+    WriteCMOS(0x0B, oldB | 0x20);                   // Включаем прерывание будильника (бит 5)
+
+    alarmFlag = 0;                                  // Сбрасываем флаг
+    enable();                                       // Разрешаем прерывания
+
+    printf("Alarm armed. Press ESC to cancel.\n");
+    // Ожидаем срабатывания будильника или нажатия ESC
+    while (!alarmFlag) {
+        if (kbhit() && getch() == 27) break;        // Выход при нажатии ESC
     }
 
-    puts("1 - print time");
-    puts("2 - set time");
-    puts("3 - set alarm");
-    puts("4 - set delay");
-    puts("0 - exit");
+    if (alarmFlag) printf("\n>>> BEEP BEEP! ALARM! <<<\n");
 
-    switch (getch()) {
-      case '1': print_time(); break;
-      case '2': set_time(); break;
-      case '3': set_alarm(); break;
-      case '4': set_delay(); break;
-      case '0': exit(0);
-    }
-  }
+    disable();                                      // Запрещаем прерывания
+    WriteCMOS(0x0B, oldB);                          // Восстанавливаем регистр B
+    outp(0xA1, oldMask);                            // Восстанавливаем маску
+    setvect(0x70, oldInt70h);                       // Восстанавливаем обработчик
+    enable();                                       // Разрешаем прерывания
+}
+
+
+int BCDToInteger(unsigned char bcd) {
+    return (bcd >> 4) * 10 + (bcd & 0x0F);
+}
+
+unsigned char IntToBCD(int value) {
+    return (unsigned char)(((value / 10) << 4) | (value % 10));
 }
